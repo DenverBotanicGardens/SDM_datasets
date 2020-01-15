@@ -5,9 +5,29 @@ date: "January 14, 2020"
 output: pdf_document
 ---
 
-Libraries
+Libraries   
 ```{r}
 library(RCurl)
+library(Rmisc)
+library(rgdal) # errors with readOGR
+library(sf)
+library(ENMeval)
+# devtools::install_github("ropensci/prism")
+library(prism)
+library(raster)
+```
+Rasterstack created from climate layers downloaded through prism, topographical layers from National Map USDA DEM layers <https://viewer.nationalmap.gov/advanced-viewer/> downloaded, tiled, converted to geotiff in R.  Digital elevation maps were turned into aspect, slope, and ruggedness in ArcGIS           
+
+```{r, eval=FALSE}
+adfs <- list.dirs(path = "~/",full.names = TRUE, recursive = TRUE)
+adf2tif <- lapply(adfs[grep("grdn",adfs)], function(x) raster(paste(x,"/hdr.adf",sep="")))
+
+lapply(1:length(adf2tif), function(r){
+  writeRaster(adf2tif[[r]],paste(adfs[[1]],"/",
+                                 gsub("^.*/", "", adfs[grep("grdn",adfs)][r]),
+                                 '.tif',sep=""),options=c('TFW=YES'), overwrite=TRUE)
+})
+
 ```
 
 
@@ -271,7 +291,7 @@ Occurrence datasets for SDMs
        3. Combined EOR and herbarium datasets of same sample size, use thin.max      
 
 ```{r}
-# Create Herbarium, EOR, and Combined datasets from distXsp
+# Create Herbarium, EOR, and Combined datasets from distXsp; lists of dataset per species
 load("~/distXsp_justHerb.Rda")
 load("~/distXsp_justEOR_forspdf.Rda")
 load("~/distXsp_combined_forspdf.Rda")
@@ -435,5 +455,65 @@ lapply(1:3, function(x) stitchtogether(atleast12, pathstart=pathstart, patternma
 
 ```
 
+# Habitat specificity    
+Only needed for either large or small background, occurrence points are the same for each
+```{r}
+
+habsp_bigbg <- habitatSpecificity(atleast12[atleast12 != 8], pathstart, replicates = 10, filenames = filenamesbig)
+
+```
+
+
+# Niche Overlap (and correlation)    
+      
+How correlated within EOR and how correlated across entire range  
+Or really how similar are the niches derived from the different data?
+```{r}
+# dismo::nicheEquivalency
+# dismo::nicheOverlap
+correlations <- function(pathstart, filenames, rasterstack, whichones){
+  lrhist <- lapply(whichones, function(i){
+    for(i in atleast12){
+          # How correlated are the averages? 
+      r1 <- raster(paste(pathstart,"AvgTiffSp",i,"Herb",filenames[1],
+                         g1g2namesall68$AcceptedName[i],".tif", sep=""))
+      r2 <- raster(paste(pathstart,"AvgTiffSp",i,"Herb",filenames[2],
+                         g1g2namesall68$AcceptedName[i],".tif", sep=""))
+      r3 <- raster(paste(pathstart,"AvgTiffSp",i,"Herb",filenames[3],
+                         g1g2namesall68$AcceptedName[i],".tif", sep=""))
+      
+      plot(r1)
+      plot(r2)
+      plot(r3)
+  }
+      
+      # Pearson correlation measures the strength of the linear relationship between normally distriubted variables
+      # Spearman rank correlation for variables not normally distributed or when the relationship is not linear. 
+      # cor_1$mean should just be the average of all pixels in each layer
+      cor_1 <- layerStats(stack(r1,r2,r3), 'pearson', na.rm=TRUE)
+      out_cor <- cor_1$`pearson correlation coefficient`
+      
+      overlaps1_2 <- nicheOverlap(r1,r2,mask=FALSE, checkNegatives = FALSE)
+      overlaps1_3 <- nicheOverlap(r1,r3, mask=FALSE, checkNegatives=FALSE)
+      overlaps2_3 <- nicheOverlap(r2,r3, mask=FALSE, checkNegatives=FALSE)
+      
+      list(cor_1, out_cor, data.frame(OverlapEOR_AsIs = overlaps1_2, 
+                                      OverlapEOR_comb = overlaps1_3, 
+                                      OverlapAsIs_comb = overlaps2_3))
+  })
+  lrhist
+}
+```
+
+# SDM correlations and niche overlap for small and large backgrounds       
+
+```{r}
+smallbackgroundcor <- correlations(pathstart = pathstart, filenames = filenames,
+                                  whichones = atleast12)
+
+bigbackgroundcor <- correlations(pathstart = pathstart, filenames = filenamesbig, 
+                                 whichones = atleast12)
+
+```
 
 
