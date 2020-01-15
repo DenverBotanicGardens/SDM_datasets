@@ -14,8 +14,254 @@ library(RCurl)
 Functions
 See danlwarren/thin.max.R
 ```{r}
+maxentrun <- function(whichones, spatialpointsdataframe_herb, 
+                      Whichproj4string = CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84"),
+                      numberofReps = 10, 
+                      maxentarguments = FALSE, predictorvariables = rasterstack, 
+                      pathstart, filenames, kfoldnum = 4, 
+                      error = FALSE, distdistribution = NULL, backgroundscale = 5000){
+        for(x in whichones){
+          pointsspdf <- SpatialPointsDataFrame(coords = spatialpointsdataframe_herb[[x]][,c("decimalLongitude",
+                                                                                            "decimalLatitude")],
+                                               data = spatialpointsdataframe_herb[[x]],
+                                               proj4string = Whichproj4string)
+          
+          if(error == TRUE){
+               # for each point I will draw a circle of size (drawn from the distribution of error seen distXspall$Dist) and then pick a random point along the circle.
+              errorpointsout <- do.call(rbind,lapply(1:nrow(pointsspdf), function(r){
+                errordist <- sample(distdistribution, 1)
+                if(errordist>0){
+                  erroraround <- gBuffer(pointsspdf[r,], width=errordist)
+                  newpoint <- erroraround@polygons[[1]]@Polygons[[1]]@coords
+                  out <- newpoint[sample(1:nrow(newpoint),1),]
+                } else {
+                  out <- pointsspdf@coords[r,]
+                  }
+                out
+                }))
+                
+                df <- SpatialPointsDataFrame(coords = errorpointsout,
+                                             data = pointsspdf@data,
+                                             proj4string = CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84"))
+                circlesout <- circles(df, d = backgroundscale) #Should be 5km around
+                polygns <- polygons(circlesout)
+                bgpnts <- spsample(polygns, 300, "stratified") # one single random location in each 'cell' 
+                
+                convertxy <- spTransform(df, CRS("+proj=longlat +datum=WGS84"))
+                proj4string(bgpnts) <- Whichproj4string
+                bgpnts <- spTransform(bgpnts, CRS("+init=epsg:4326") )
+          } else {
+                convertxy <- spTransform(pointsspdf, CRS("+proj=longlat +datum=WGS84"))
+                circlesout <- circles(pointsspdf, d = backgroundscale)
+                polygns <- polygons(circlesout)
+                bgpnts <- spsample(polygns, 300, "stratified")
+                proj4string(bgpnts) <- Whichproj4string
+                bgpnts <- spTransform(bgpnts, CRS("+init=epsg:4326") )
+            
+          }
+            
+             for(rep in 1:numberofReps){
+                convertxy$kfold <- kfold(convertxy, k=kfoldnum) # to have 75:25%
+                if(maxentarguments == TRUE){
+                  xm <- maxent(x = predictorvariables,p = convertxy[convertxy$kfold!=1,], a = bgpnts@coords,
+                           args=c("noautofeature","noproduct","nothreshold"))
+                } else {
+                  xm <- maxent(x = predictorvariables,p = convertxy[convertxy$kfold!=1,], a = bgpnts@coords)
+                }
+                
+                write.csv(data.frame(convertxy@coords,convertxy@data),
+                          paste(pathstart,"presenceHerb",filenames,"Sp",x,"kfold",rep,".csv", sep=""))
+                # write.csv(data.frame(bgpnts@coords, convertxy@data[1,c("Species","Area")]),
+                #           paste(pathstart,"presenceHerb",filenames,"Sp",x,"kfold",rep,".csv", sep=""))
+                save(xm, file= paste(pathstart,"maxentHerb",filenames,"Sp",x,"kfold",rep,".Rda", sep=""))        
+        
+                gc()
+                #register parallel computing backend
+                ncores <- detectCores()-1
+                cl = parallel::makeCluster(ncores)
+                doParallel::registerDoParallel(cl,ncores)
+                #compute indices for data splitting
+                rows = 1:nrow(predictorvariables)
+                split = sort(rows%%ncores)+1
+                outname = paste(pathstart,"PredictHerb",filenames,"Sp", x,"kfold",rep, sep="")
+                #perform the prediction on subsets of the predictor dataset
+                foreach(i=unique(split), .combine=c)%dopar%{
+                  rows_sub = rows[split==i]
+                  sub = raster::crop(predictorvariables,raster::extent(predictorvariables, min(rows_sub), max(rows_sub), 
+                                                                1, ncol(predictorvariables)))
+                  raster::predict(sub, xm, filename=paste(outname, i, sep="_"), overwrite=TRUE)
+                }
+        
+                e <- evaluate(convertxy[convertxy$kfold==1,], bgpnts, xm, predictorvariables)
+                save(e, file= paste(pathstart,"evaluateHerb",filenames,"Sp",x,"kfold",rep,".Rda", sep=""))
+        
+                rm(xm)
+                gc()
+                stopCluster(cl)
+             }
+                e
+        }
+}
 
 
+stitchtogether <- function(whichones, pathstart, patternmatch, rasternames){
+  lapply(whichones, function(i){
+  gc()
+  lapply(1:10, function(k){
+    resultpath <- list.files(path = pathstart, 
+                             pattern = paste(patternmatch,i,"kfold",k,"_",sep=""), 
+                             full.names=TRUE)
+    rastout <- lapply(resultpath, function(x){
+      raster(x)
+      })
+    rastout$filename <- paste(pathstart,"ProbTiffSp",i,rasternames,k,".tif", sep="")
+    rastout$overwrite <- TRUE
+    m <- do.call(merge, rastout)
+  })
+})
+}
+forhistofaverage <- function(whichones = atleast12, pathstart, patternmatch){
+  stacktoaverage <- lapply(whichones, function(i){
+    rasterstoavg <- list.files(path = pathstart, 
+                               pattern = paste("ProbTiffSp",
+                                               i,
+                                               patternmatch,sep=""), 
+                               full.names=TRUE)
+    ras <- stack(lapply(rasterstoavg, function(y){
+      raster(y)
+    }))
+    beginCluster(10)
+    ras.mean <- clusterR(ras, calc, args=list(mean, na.rm=T))
+    writeRaster(ras.mean, paste(pathstart,
+                                "AvgTiffSp",i,patternmatch,g1g2namesall68$AcceptedName[i],
+                                ".tif", sep=""),overwrite=TRUE)
+    gc()
+    endCluster()
+    ras.mean
+  })
+  stacktoaverage
+}
+
+habitatSpecificity <- function(whichones, pathstart, replicates = 10, filenames, rasterstack){
+  
+  # collect all the presence points used in the SDM
+  habsp <- do.call(rbind,lapply(whichones, function(x){
+    out <- do.call(rbind,lapply(filenames, function(nams){
+      outno <- do.call(rbind,lapply(1:replicates, function(rep){
+        load(paste(pathstart,"maxentHerb", nams, "Sp", x,"kfold",rep, ".Rda",sep=""))
+        outinner <- data.frame(SpeciesNum = x, kfold = rep, HerbType = nams, xm@presence)
+        outinner
+        }))
+      outno      
+    }))
+    out
+  }))
+  prPCA <- princomp(habsp[,-c(1:3)])
+  allsphabsp <- data.frame(habsp[,1:3],prPCA$scores)
+  allsphabsp$HerbType <- as.character(allsphabsp$HerbType)
+  
+  # for all species and both error and no and EOR, dropping parameters (kfolds in EOR; only 1)
+  habspecificity <- do.call(rbind,
+                            lapply(split(allsphabsp, 
+                                         list(allsphabsp$SpeciesNum,
+                                              allsphabsp$kfold,
+                                              allsphabsp$HerbType), drop=TRUE), function(x){
+      p <- ggplot(x, aes(Comp.1,Comp.2))+
+      geom_point()+
+      stat_ellipse(segments=201) #default is to draw 51 line segments to make the ellipse
+    # get ellipse coordinates
+    pb <- ggplot_build(p)
+    table(pb$data[[2]]$group)
+    el <- pb$data[[2]][c("x","y")]
+    
+    # Center of ellipse
+    ctr <- MASS::cov.trob(el)$center
+    
+    # Distance to center from each point on ellipse
+    dist2center <- sqrt(rowSums((t(t(el)-ctr))^2))
+    
+    # Area of ellipse from semi-major and semi-minor axes which are largest and smallest of dist to center
+    habitatspecificity <- pi*min(dist2center)*max(dist2center)
+    ellipseoutfold <- data.frame(SpeciesNum = unique(x$SpeciesNum), 
+                                 kfold = unique(x$kfold), 
+                                 HerbType = unique(x$HerbType), habspec = habitatspecificity)
+    ellipseoutfold
+        }))
+  habspecificity
+}
+# probmapnames = "Herb", filename, "kfold" ; i.e. 'rasternames' below
+accuracyhists <- function(pathstart, probmapnames, whichones, reps = 1:10){
+  lapply(whichones, function(i){
+    lapply(1:length(probmapnames), function(p){
+  lrhist <- lapply(reps, function(k){
+    r <- raster(paste(pathstart,"ProbTiffSp",i,probmapnames[p],k,".tif", sep=""))
+    
+    polys <- l1G1G2and[l1G1G2and$GNAME %in% c(g1g2namesall68$AcceptedName[i],
+                                    g1g2namesall68$Taxon[i]),] 
+    # Only want ones after 1980
+    years <- as.numeric(substring(polys$LASTOBS,1,4))
+    yearlater1980 <- c()
+    for(l in 1:length(years)){
+      yearlater1980[l] <- if(years[l]>1980 & years[l]<2020){ # there are 4 unknown year 9999
+                                      l } else {
+                                        NA
+                                      }
+    }
+    yearlater1980 <- yearlater1980[!is.na(yearlater1980)]
+    polys <- polys[yearlater1980,]
+    
+    proj4string(polys) <- CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84") # CRS("+init=epsg:26913")
+    
+    f <- spTransform(polys, CRS("+proj=longlat +datum=WGS84"))   
+    fr <- extract(r, f, small = TRUE, weights = TRUE)
+    # Want the value [,1] for each polygon but use the weight [,2] to get the pro-rated cells 
+    out <- do.call(rbind,fr)
+    out
+    })
+  lrhist
+  })
+  })
+}
+
+
+accuracyhistsOneperSp <- function(pathstart, whichones = atleast12, SDorAVG = "Avg", filenames){
+  lapply(whichones, function(i){
+    datatype <- do.call(rbind,lapply(filenames, function(file){
+    resultpath <- list.files(path = pathstart, 
+                         pattern = paste(SDorAVG,"TiffSp",i,"Herb",file,
+                                         g1g2namesall68$AcceptedName[i], sep=""), 
+                         full.names=TRUE)
+    
+    r <- raster(resultpath)
+    polys <- l1G1G2and[l1G1G2and$GNAME %in% c(g1g2namesall68$AcceptedName[i],
+                                              g1g2namesall68$Taxon[i]),] 
+    # Only want ones after 1980
+    years <- as.numeric(substring(polys$LASTOBS,1,4))
+    yearlater1980 <- c()
+    for(l in 1:length(years)){
+      yearlater1980[l] <- if(years[l]>1980 & years[l]<2020){
+                                      l } else {
+                                        NA
+                                      }
+    }
+    yearlater1980 <- yearlater1980[!is.na(yearlater1980)]
+    polys <- polys[yearlater1980,]
+    
+    proj4string(polys) <- CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84") # CRS("+init=epsg:26913")
+    
+    f <- spTransform(polys, CRS("+proj=longlat +datum=WGS84"))   
+    fr <- extract(r, f, small = TRUE, weights = TRUE)
+    # Want the value [,1] for each polygon but use the weight [,2] to get the pro-rated cells 
+    out <- do.call(rbind,fr)
+    out <- as.data.frame(out)
+    out$DataType <- file
+    out$SpNum <- i
+    out$AcceptedName <- g1g2namesall68$AcceptedName[i]
+    out
+    }))
+    datatype
+  })
+}
 ```
 
 
@@ -25,13 +271,16 @@ Occurrence datasets for SDMs
        3. Combined EOR and herbarium datasets of same sample size, use thin.max      
 
 ```{r}
-# 1. Herbarium specimens 
-load("~/coloradosps.Rda")
+# Create Herbarium, EOR, and Combined datasets from distXsp
+load("~/distXsp_justHerb.Rda")
+load("~/distXsp_justEOR_forspdf.Rda")
+load("~/distXsp_combined_forspdf.Rda")
 
-# 2. Create EOR and Combined datasets, collect data from closest herbarium points and EOR polygons
-load("~/distXsp_EOR")
+# species with sample sizes >= 12
+load("~/atleast12.Rda")
 
-distXsp_EOR <- lapply(1:nrow(g1g2namesall68), function(i){
+# Created from the master list, need polygons
+distXsp <- lapply(1:nrow(g1g2namesall68), function(i){
   gc()
   g1g2now <- coloradosps.g1g2_168[coloradosps.g1g2_168$scientificName %in%
                                 c(g1g2namesall68$Taxon[i],g1g2namesall68$AcceptedName[i])&
@@ -59,7 +308,6 @@ distXsp_EOR <- lapply(1:nrow(g1g2namesall68), function(i){
   
   
   if(nrow(g1g2now)>0){
-  # put grid points across colorado, sample from it for each polygons
     polys <- l1G1G2and[l1G1G2and$GNAME %in% c(g1g2namesall68$AcceptedName[i],
                                         g1g2namesall68$Taxon[i]),] 
     proj4string(polys) <- CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84") # CRS("+init=epsg:26913")
@@ -70,7 +318,7 @@ distXsp_EOR <- lapply(1:nrow(g1g2namesall68), function(i){
   
   # Convert polys to match rasterstack; only those mapped after 1980
     polys@data$LASTOBS <- as.numeric(substring(polys@data$LASTOBS,1,4))
-    polys <- polys[polys@data$LASTOBS < 2020,] # when keeping all polys, need to remove unknown year
+    polys <- polys[polys@data$LASTOBS < 2020,] # when keeping all polys, need to remove unknown year 9999
     polys_after1980 <- polys[polys$LASTOBS > 1980 & polys$LASTOBS < 2020,] # and not unknown 9999
     polys_latlon <- spTransform(polys, CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
     # Get cell number of where the herbarium specimens fall; for records after 1980; sample size reduced if fall within same raster cell based on the ca. 1 km size of the climate variables
@@ -113,5 +361,79 @@ distXsp_EOR <- lapply(1:nrow(g1g2namesall68), function(i){
   })
 
 ```
+Create SDM for datasets    
+for backgrounds of 5000 meters around occurrence points    
+```{r}
+
+filenames <-  c("Herbarium_bg5000","EOR_bg5000","Combined_bg5000")
+pathstart <- ("~/") # Set path to desired folder to hold data
+
+# Run SDM with Maxent
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"),
+          spatialpointsdataframe_herb = distXsp_justHerb,
+          maxentarguments = FALSE, filenames = filenames[1], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 5000)
+
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"),
+          spatialpointsdataframe_herb = distXsp_justEOR_spdf,
+          maxentarguments = FALSE, filenames = filenamesbig[2], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 500000)
+
+
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"),
+          spatialpointsdataframe_herb = distXsp_combined_spdf,
+          maxentarguments = FALSE, filenames = filenames[3], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 5000)
+
+```
+
+Large background
+```{r}
+filenamesbig <-  c("Herbarium_bg500000","EOR_bg500000","Combined_bg500000")
+pathstart <- ("~/")
+
+# Herbarium 
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84"),
+          spatialpointsdataframe_herb = distXsp_justHerb,
+          maxentarguments = FALSE, filenames = filenamesbig[1], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 500000)
+
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"),
+          spatialpointsdataframe_herb = distXsp_justEOR_spdf,
+          maxentarguments = FALSE, filenames = filenamesbig[2], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 500000)
+
+# Combined herb and error distXsp_EOR[[]][[3]] and turned into distXsp_combined_spdf renaming x and y to decimalLat...
+maxentrun(whichones = atleast12, numberofReps = 10, error = FALSE,
+          Whichproj4string = CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"),
+          spatialpointsdataframe_herb = distXsp_combined_spdf,
+          maxentarguments = FALSE, filenames = filenamesbig[3], 
+          predictorvariables = rasterstack, pathstart = pathstart, backgroundscale = 500000)
+
+```
+
+
+SDM maps created in 10 strips to reduce computation time and size of memory required
+```{r}
+#Small background 
+patternmatch <- paste("PredictHerb", filenames, "Sp", sep="")
+rasternames <- paste("Herb", filenames, "kfold", sep="")
+
+lapply(1:3, function(x) stitchtogether(atleast12, pathstart=pathstart, patternmatch = patternmatch[x], rasternames = rasternames[x]))
+
+# Large background
+patternmatchbig <- paste("PredictHerb", filenamesbig, "Sp", sep="")
+rasternamesbig <- paste("Herb", filenamesbig, "kfold", sep="")
+
+lapply(1:3, function(x) stitchtogether(atleast12, pathstart=pathstart, patternmatch = patternmatchbig[x], rasternames = rasternames[x]))
+
+
+```
+
 
 
