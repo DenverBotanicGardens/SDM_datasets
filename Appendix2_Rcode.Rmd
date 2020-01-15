@@ -1,0 +1,117 @@
+---
+title: "Occurence datasets SDM"
+author: "Michelle DePrenger-Levin"
+date: "January 14, 2020"
+output: pdf_document
+---
+
+Libraries
+```{r}
+library(RCurl)
+```
+
+
+Functions
+See danlwarren/thin.max.R
+```{r}
+
+
+```
+
+
+Occurrence datasets for SDMs    
+       1. Herbarium specimens    
+       2. EORs sample size matching Herbarium specimens sample size, use thin.max; polygons can be purchased from the Colorado Natural Heritage Program <https://cnhp.colostate.edu/>    
+       3. Combined EOR and herbarium datasets of same sample size, use thin.max      
+
+```{r}
+# 1. Herbarium specimens 
+load("~/coloradosps.Rda")
+
+# 2. Create EOR and Combined datasets, collect data from closest herbarium points and EOR polygons
+load("~/distXsp_EOR")
+
+distXsp_EOR <- lapply(1:nrow(g1g2namesall68), function(i){
+  gc()
+  g1g2now <- coloradosps.g1g2_168[coloradosps.g1g2_168$scientificName %in%
+                                c(g1g2namesall68$Taxon[i],g1g2namesall68$AcceptedName[i])&
+                                !is.na(coloradosps.g1g2_168$decimalLatitude),]
+  g1g2now$year <- as.numeric(as.character(substring(g1g2now$year,1,4)))
+   # remove points with errors in the year field
+  g1g2now <- g1g2now[g1g2now$year>1800,]
+  
+  g1g2now$decimalLatitude <- as.numeric(as.character(g1g2now$decimalLatitude))
+  g1g2now$decimalLongitude <- as.numeric(as.character(g1g2now$decimalLongitude))
+  # remove points not in Colorado
+  g1g2now <- g1g2now[g1g2now$decimalLatitude>35,]
+  g1g2now <- g1g2now[g1g2now$decimalLongitude>(-113),]
+  # discard observations that lack specimens
+  g1g2now <- g1g2now[grepl("Specimen",g1g2now$basisOfRecord),]
+  g1g2now <- g1g2now[,c("scientificName","scientificNameAuthorship","institutionCode", 
+                        "recordedBy","year","decimalLatitude","decimalLongitude")] # ,"lat2","lon2"
+  # remove duplicate locations
+  g1g2now$lonRounded <- round(g1g2now$decimalLongitude,4) # "The fourth decimal place is worth up to 11 m: it can identify a parcel of land. It is comparable to the typical accuracy of an uncorrected GPS unit with no interference."
+  g1g2now$latRounded <- round(g1g2now$decimalLatitude,4)
+  # reverse sort so the newest is kept when duplicates
+  g1g2now <- g1g2now[order(g1g2now$year, decreasing = TRUE),]
+  g1g2now <- g1g2now[!duplicated(g1g2now[c("latRounded","lonRounded")]),]
+  gc()
+  
+  
+  if(nrow(g1g2now)>0){
+  # put grid points across colorado, sample from it for each polygons
+    polys <- l1G1G2and[l1G1G2and$GNAME %in% c(g1g2namesall68$AcceptedName[i],
+                                        g1g2namesall68$Taxon[i]),] 
+    proj4string(polys) <- CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84") # CRS("+init=epsg:26913")
+    
+    totalarea <- sum(area(disaggregate(polys)))
+  # area of each polygon
+    # areanow <- sapply(slot(polys,"polygons"), slot, "area")
+  
+  # Convert polys to match rasterstack; only those mapped after 1980
+    polys@data$LASTOBS <- as.numeric(substring(polys@data$LASTOBS,1,4))
+    polys <- polys[polys@data$LASTOBS < 2020,] # when keeping all polys, need to remove unknown year
+    polys_after1980 <- polys[polys$LASTOBS > 1980 & polys$LASTOBS < 2020,] # and not unknown 9999
+    polys_latlon <- spTransform(polys, CRS("+proj=longlat +datum=WGS84 +no_defs +ellps=WGS84 +towgs84=0,0,0"))
+    # Get cell number of where the herbarium specimens fall; for records after 1980; sample size reduced if fall within same raster cell based on the ca. 1 km size of the climate variables
+      Herbcell <- cellFromXY(rasterstack, g1g2now[g1g2now$year>1980
+                                                  ,c("decimalLongitude","decimalLatitude")])
+    # Get cell number
+      cell <- cellFromPolygon(rasterstack, polys_latlon, weights =TRUE)
+      EORpnts <- rasterToPoints(rasterstack[[1]])[unique(as.vector(do.call(rbind,cell)[,1])),c(1:2)]
+    # Thin to same number of points available in Herbarium specimens
+      EORpnts <- thin.max(EORpnts,c("x","y"),length(unique(Herbcell)))
+        
+    gc()
+    
+    
+    # Combine the two and thin to Herbcell, make sure no duplicate points
+    combined <- rbind(EORpnts, data.frame(x = g1g2now$lonRounded, y = g1g2now$latRounded))
+    combined <- combined[!duplicated(combined[,c("x","y")]),]
+    combined <- thin.max(combined, c("x","y"),length(unique(Herbcell)))
+        
+    
+  #turn into spatialpointsdataframe for individual species
+    coordinates(g1g2now) <- ~decimalLongitude+decimalLatitude
+    proj4string(g1g2now) <- CRS("+init=epsg:4326")  # CRS("+proj=longlat +datum=WGS84")
+    g1g2now <- spTransform(g1g2now, CRS("+proj=utm +zone=13 ellps=NAD83 +ellps=WGS84"))
+  # The minimum distance from each point to the nearest polygon
+    distnow <- apply(gDistance(g1g2now,polys, byid=TRUE),2,min)
+    gc()
+    
+    g1g2distarea <- data.frame(Species = g1g2namesall68$AcceptedName[i], 
+                               g1g2now,Dist = distnow, Area = totalarea,
+                               EORdate = polys$LASTOBS[apply(gDistance(g1g2now,polys,
+                                                                       byid=TRUE),2,which.min)],
+                               Yeardiff = g1g2now$year- as.numeric(substring(as.character(polys$LASTOBS[apply(gDistance(g1g2now,polys, byid=TRUE),2,which.min)]),1,4)))
+    gc()
+    
+    out <- list(g1g2distarea, EORpnts, combined)
+    gc()
+    out
+    }
+  })
+
+```
+
+
